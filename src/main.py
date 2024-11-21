@@ -1,12 +1,9 @@
 from fastapi import FastAPI, HTTPException, Depends
 from fastapi.security import OAuth2PasswordBearer
-from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, validator
+from pydantic import BaseModel
 from typing import List, Optional
-from datetime import datetime, timezone, timedelta
+from datetime import datetime
 import uvicorn
-import json
-import asyncio
 
 from claudesync.configmanager import InMemoryConfigManager
 from claudesync.providers.claude_ai import ClaudeAIProvider
@@ -15,16 +12,29 @@ from claudesync.exceptions import ProviderError, ConfigurationError
 app = FastAPI(title="ClaudeSync API")
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
 
-# Pydantic models
+# Pydantic models for request/response
+from pydantic import validator
+
 class LoginRequest(BaseModel):
     session_key: str
-    expires: Optional[str] = None
+    expires: Optional[str] = None  # Optional expiry date
     
     @validator('session_key')
     def validate_session_key(cls, v):
         if not v.startswith('sk-ant-'):
             raise ValueError('Session key must start with sk-ant-')
         return v
+
+    @validator('expires')
+    def validate_expires(cls, v):
+        if v is None:
+            return v
+        try:
+            # Try to parse the date if provided
+            datetime.strptime(v, "%a, %d %b %Y %H:%M:%S %Z")
+            return v
+        except ValueError:
+            raise ValueError('Invalid date format. Use format: Mon, 01 Jan 2025 00:00:00 UTC')
 
 class LoginResponse(BaseModel):
     message: str
@@ -57,32 +67,9 @@ config = InMemoryConfigManager()
 provider = None
 
 def get_provider():
-    global provider
     if not provider:
         raise HTTPException(status_code=401, detail="Not authenticated")
     return provider
-
-async def stream_chat_response(org_id: str, chat_id: str, message: ChatMessage, provider: ClaudeAIProvider):
-    try:
-        async def generate():
-            for event in provider.send_message(org_id, chat_id, message.prompt, message.timezone):
-                if isinstance(event, dict):
-                    yield f"data: {json.dumps(event)}\n\n"
-                else:
-                    yield f"data: {json.dumps({'text': str(event)})}\n\n"
-            yield "data: [DONE]\n\n"
-    
-        return StreamingResponse(
-            generate(),
-            media_type="text/event-stream",
-            headers={
-                "Cache-Control": "no-cache",
-                "Connection": "keep-alive",
-                "Content-Type": "text/event-stream",
-            }
-        )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/auth/login", response_model=LoginResponse)
 async def login(login_data: LoginRequest):
@@ -91,12 +78,17 @@ async def login(login_data: LoginRequest):
         config.set("claude_api_url", "https://api.claude.ai/api")
         provider = ClaudeAIProvider(config)
         
-        expiry = datetime.now(timezone.utc) + timedelta(days=365) if not login_data.expires else \
-                datetime.strptime(login_data.expires, "%a, %d %b %Y %H:%M:%S %Z")
+        # Set default expiry to 1 year from now if not provided
+        if login_data.expires:
+            expiry = datetime.strptime(login_data.expires, "%a, %d %b %Y %H:%M:%S %Z")
+        else:
+            expiry = datetime.now(timezone.utc) + timedelta(days=365)
+            login_data.expires = expiry.strftime("%a, %d %b %Y %H:%M:%S UTC")
         
+        # Store session key
         config.set_session_key("claude.ai", login_data.session_key, expiry)
         
-        # Verify the session key
+        # Verify the session key works by making a test request
         try:
             orgs = provider.get_organizations()
             if not orgs:
@@ -107,28 +99,44 @@ async def login(login_data: LoginRequest):
         return LoginResponse(
             message="Successfully authenticated with claude.ai",
             session_key=login_data.session_key,
-            expires=expiry.strftime("%a, %d %b %Y %H:%M:%S UTC")
+            expires=login_data.expires
         )
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
-@app.get("/organizations")
-async def get_organizations(current_provider: ClaudeAIProvider = Depends(get_provider)):
+@app.get("/organizations", response_model=List[Organization])
+async def get_organizations(provider: ClaudeAIProvider = Depends(get_provider)):
     try:
-        orgs = current_provider.get_organizations()
+        orgs = provider.get_organizations()
         return orgs
     except ProviderError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
-@app.get("/organizations/{org_id}/projects")
+@app.get("/organizations/{org_id}/projects", response_model=List[Project])
 async def get_projects(
     org_id: str,
     include_archived: bool = False,
-    current_provider: ClaudeAIProvider = Depends(get_provider)
+    provider: ClaudeAIProvider = Depends(get_provider)
 ):
     try:
-        projects = current_provider.get_projects(org_id, include_archived)
+        projects = provider.get_projects(org_id, include_archived)
         return projects
+    except ProviderError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.post("/organizations/{org_id}/projects")
+async def create_project(
+    org_id: str,
+    project_data: ProjectCreate,
+    provider: ClaudeAIProvider = Depends(get_provider)
+):
+    try:
+        project = provider.create_project(
+            org_id,
+            project_data.name,
+            project_data.description
+        )
+        return project
     except ProviderError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -136,10 +144,10 @@ async def get_projects(
 async def create_chat(
     org_id: str,
     chat_data: ChatCreate,
-    current_provider: ClaudeAIProvider = Depends(get_provider)
+    provider: ClaudeAIProvider = Depends(get_provider)
 ):
     try:
-        chat = current_provider.create_chat(
+        chat = provider.create_chat(
             org_id,
             chat_data.chat_name,
             chat_data.project_uuid
@@ -151,40 +159,81 @@ async def create_chat(
 @app.get("/organizations/{org_id}/chats")
 async def get_chats(
     org_id: str,
-    current_provider: ClaudeAIProvider = Depends(get_provider)
+    provider: ClaudeAIProvider = Depends(get_provider)
 ):
     try:
-        chats = current_provider.get_chat_conversations(org_id)
+        chats = provider.get_chat_conversations(org_id)
         return chats
     except ProviderError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
+@app.get("/organizations/{org_id}/chats/{chat_id}")
+async def get_chat(
+    org_id: str,
+    chat_id: str,
+    provider: ClaudeAIProvider = Depends(get_provider)
+):
+    try:
+        chat = provider.get_chat_conversation(org_id, chat_id)
+        return chat
+    except ProviderError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+# Quick chat without project
 @app.post("/organizations/{org_id}/chat")
 async def quick_chat(
     org_id: str,
     message: ChatMessage,
-    current_provider: ClaudeAIProvider = Depends(get_provider)
+    provider: ClaudeAIProvider = Depends(get_provider)
 ):
     try:
-        # Create a new chat
-        chat = current_provider.create_chat(org_id)
-        if not chat:
-            raise HTTPException(status_code=500, detail="Failed to create chat")
-        
+        # Create a new chat first
+        chat = provider.create_chat(org_id)
         chat_id = chat["uuid"]
-        return await stream_chat_response(org_id, chat_id, message, current_provider)
-    
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        
+        # Then send the message
+        async def message_stream():
+            for event in provider.send_message(org_id, chat_id, message.prompt, message.timezone):
+                yield f"data: {json.dumps(event)}\n\n"
+                
+        return StreamingResponse(
+            message_stream(),
+            media_type="text/event-stream"
+        )
+    except ProviderError as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
 @app.post("/organizations/{org_id}/chats/{chat_id}/messages")
 async def send_message(
     org_id: str,
     chat_id: str,
     message: ChatMessage,
-    current_provider: ClaudeAIProvider = Depends(get_provider)
+    provider: ClaudeAIProvider = Depends(get_provider)
 ):
-    return await stream_chat_response(org_id, chat_id, message, current_provider)
+    try:
+        # Create StreamingResponse for the message stream
+        async def message_stream():
+            for event in provider.send_message(org_id, chat_id, message.prompt, message.timezone):
+                yield f"data: {json.dumps(event)}\n\n"
+                
+        return StreamingResponse(
+            message_stream(),
+            media_type="text/event-stream"
+        )
+    except ProviderError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.delete("/organizations/{org_id}/chats")
+async def delete_chats(
+    org_id: str,
+    chat_ids: List[str],
+    provider: ClaudeAIProvider = Depends(get_provider)
+):
+    try:
+        result = provider.delete_chat(org_id, chat_ids)
+        return result
+    except ProviderError as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
